@@ -1,31 +1,44 @@
+import "reflect-metadata";
+import { initialize } from "./firestore";
+initialize();
+
 import dotenv from "dotenv";
 import { CommandsService } from "./commands/commands.service";
-import { ICommand, IGuild, IHoot, Plan } from "./types";
+import { ICommand, IHoot, Plan } from "./types";
 import { Client } from "./client";
 import express from "express";
 import { SlashCommandBuilder } from "discord.js";
-import { supabase } from "./supabase.config";
 import { hootCommand } from "./commands/hoot";
 import cors from "cors";
 
+import { hootRepository } from "./models/hoot";
+import { guildRepository } from "./models/guild";
 dotenv.config();
+
 const PORT = process.env.PORT;
 
 const client = new Client().init();
 const commandsService = new CommandsService(client);
 
-client.on("ready", () =>
-  console.log(`🚀 Logged in as ${client?.user?.tag} 🚀`)
-);
+client.on("ready", async () => {
+  console.log(`🚀 Logged in as ${client?.user?.tag} 🚀`);
+});
 /**
  * ON GUILD JOIN
  * Add slash commands into that guild.
  */
 client.on("guildCreate", async (guild) => {
-  const { error } = await supabase
-    .from("guilds")
-    .insert(<IGuild>{ id: guild.id, name: guild.name, plan: Plan.BASIC });
-  if (error) return console.log(error);
+  await guildRepository.create({
+    id: guild.id,
+    name: guild.name,
+    plan: Plan.BASIC,
+  });
+  // await firestore.collection("guilds").doc().set({
+  //   id: guild.id,
+  //   name: guild.name,
+  //   plan: Plan.BASIC,
+  // });
+
   return commandsService.commandsInit(guild.id);
 });
 /**
@@ -41,13 +54,12 @@ client.on("interactionCreate", async (interaction) => {
   const command = client.commands.get(interaction.commandName) as ICommand;
   if (command) return command.run({ client, interaction });
 
+  const hoot = await hootRepository
+    .whereEqualTo((hoot) => hoot.name, interaction.commandName)
+    .whereEqualTo((hoot) => hoot.guildId, interaction.guildId)
+    .findOne();
+
   // HOSTED COMMANDS HANDLER
-  const { data: hoot } = await supabase
-    .from<IHoot>("hoots")
-    .select("*")
-    .eq("name", interaction.commandName)
-    .eq("guildId", interaction.guildId ?? "")
-    .single();
 
   if (hoot) {
     return hootCommand({
@@ -63,6 +75,7 @@ client.on("interactionCreate", async (interaction) => {
 client.login(process.env.TOKEN);
 
 const api = express();
+
 api.use(express.json());
 api.use(
   cors({
@@ -91,8 +104,7 @@ api.post("/uploads/:guildId", async (req, res) => {
     .setDescription("Custom Command");
   const cmd = await commandsService.commandCreate(guildId, newCommand);
 
-  // Upload to supabase
-  const { error, data } = await supabase.from("hoots").insert(<IHoot>{
+  const newHoot = await hootRepository.create({
     id: cmd.id,
     name,
     guildId,
@@ -100,16 +112,16 @@ api.post("/uploads/:guildId", async (req, res) => {
     start,
     end,
   });
-  if (error) return console.log(error);
 
-  res.json(data);
+  return res.json(newHoot);
 });
 
 api.delete("/uploads/:guildId/:id", async (req, res) => {
   const { id, guildId } = req.params;
   await commandsService.commandDelete(guildId, id);
-  const { error } = await supabase.from("hoots").delete().match({ id });
-  if (error) return console.log(error);
+
+  await hootRepository.delete(id);
+
   res.json({
     success: true,
   });
@@ -118,28 +130,20 @@ api.delete("/uploads/:guildId/:id", async (req, res) => {
 api.get("/uploads/:guildId", async (req, res) => {
   const { guildId } = req.params;
 
-  const { error, data } = await supabase
-    .from("hoots")
-    .select("*")
-    .match({ guildId });
-  if (error) res.send(error);
+  const hoots = await hootRepository
+    .whereEqualTo((hoot) => hoot.guildId, guildId)
+    .find();
 
-  res.json(data);
+  res.json(hoots);
 });
 
 api.get("/uploads/:guildId/:id", async (req, res) => {
   const { guildId, id } = req.params;
 
-  const { error, data } = await supabase
-    .from("hoots")
-    .select("*")
-    .match({ guildId, id })
-    .single();
-
-  if (error) {
-    res.send(error);
-    return;
-  }
+  const data = await hootRepository
+    .whereEqualTo((hoot) => hoot.guildId, guildId)
+    .whereEqualTo((hoot) => hoot.id, id)
+    .findOne();
 
   res.json(data);
 });
@@ -148,19 +152,21 @@ api.patch("/uploads/:guildId/:id", async (req, res) => {
   const { guildId, id } = req.params;
   const { end, start, name } = req.body;
 
-  const { error, data } = await supabase
-    .from("hoots")
-    .update({ end, start, name })
-    .eq("id", id)
-    .eq("guildId", guildId)
-    .select();
+  const hoot = await hootRepository
+    .whereEqualTo((hoot) => hoot.guildId, guildId)
+    .whereEqualTo((hoot) => hoot.id, id)
+    .findOne();
 
-  if (error) {
-    res.send(error);
-    return;
-  }
+  if (!hoot) return res.status(404).send("Not Found");
 
-  res.json(data);
+  const data = await hootRepository.update({
+    ...hoot,
+    end,
+    start,
+    name,
+  });
+
+  return res.json(data);
 });
 
 api.get("/uploads/check/:guildId/:name", async (req, res) => {
